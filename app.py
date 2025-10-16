@@ -1029,7 +1029,7 @@ class HackearView(View):
         if interaction.user.id != self.ctx.author.id:
             await interaction.response.send_message("Solo quien inició puede responder.", ephemeral=True)
             return
-        modal = HackearModal(self.ctx, self.member, self.datos, self.uid, self.target_uid, self.correct_code)
+        modal = HackearModal(self.ctx, self.member, self.datos, self.uid, self.target_uid, self.correct_code, self.sent_message)
         await interaction.response.send_modal(modal)
 
 class RobarView(View):
@@ -2815,3 +2815,4 @@ async def lb(ctx):
 if __name__ == "__main__":
     # Pon tu token aquí de forma segura
     bot.run(os.getenv("DISCORD_TOKEN"))
+
