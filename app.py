@@ -659,8 +659,12 @@ async def on_command_error(ctx, error):
 # --- ADD MONEY ---
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def addmoney(ctx, miembro: discord.Member, cantidad: int):
-    """Agrega dinero en efectivo (cash) a un usuario."""
+async def addmoney(ctx, miembro: discord.Member, cantidad: int, tipo: str = "cash"):
+    """Agrega dinero en efectivo (cash) o al banco (bank) a un usuario."""
+    if tipo.lower() not in ["cash", "bank"]:
+        await ctx.send("❌ Tipo inválido. Usa 'cash' o 'bank'.")
+        return
+
     datos = cargar_datos()
     uid = str(miembro.id)
     asegurar_usuario(datos, uid)
@@ -669,16 +673,23 @@ async def addmoney(ctx, miembro: discord.Member, cantidad: int):
         await ctx.send("❌ Ingresa una cantidad válida mayor que 0.")
         return
 
-    agregar_a_cash(datos, uid, cantidad)
+    if tipo.lower() == "bank":
+        datos[uid]["bank"] = datos[uid].get("bank", 0) + cantidad
+    else:
+        agregar_a_cash(datos, uid, cantidad)
     guardar_datos(datos)
 
-    await ctx.send(f"✅ Se añadieron {cantidad} <:amatista:1420736192269390006> a {miembro.mention} (cash).")
+    await ctx.send(f"✅ Se añadieron {cantidad} <:amatista:1420736192269390006> a {miembro.mention} ({tipo.lower()}).")
 
 # --- REMOVE MONEY ---
 @bot.command()
 @commands.has_permissions(administrator=True)
-async def removemoney(ctx, miembro: discord.Member, cantidad: int):
-    """Resta dinero en efectivo (cash) a un usuario."""
+async def removemoney(ctx, miembro: discord.Member, cantidad: int, tipo: str = "cash"):
+    """Resta dinero en efectivo (cash) o al banco (bank) a un usuario."""
+    if tipo.lower() not in ["cash", "bank"]:
+        await ctx.send("❌ Tipo inválido. Usa 'cash' o 'bank'.")
+        return
+
     datos = cargar_datos()
     uid = str(miembro.id)
     asegurar_usuario(datos, uid)
@@ -687,14 +698,19 @@ async def removemoney(ctx, miembro: discord.Member, cantidad: int):
         await ctx.send("❌ Ingresa una cantidad válida mayor que 0.")
         return
 
-    efectivo_actual = datos[uid].get("cash", 0)
-    if cantidad > efectivo_actual:
-        cantidad = efectivo_actual  # no dejes negativo
-
-    restar_de_cash(datos, uid, cantidad)
+    if tipo.lower() == "bank":
+        bank_actual = datos[uid].get("bank", 0)
+        if cantidad > bank_actual:
+            cantidad = bank_actual  # no dejes negativo
+        datos[uid]["bank"] = bank_actual - cantidad
+    else:
+        efectivo_actual = datos[uid].get("cash", 0)
+        if cantidad > efectivo_actual:
+            cantidad = efectivo_actual  # no dejes negativo
+        restar_de_cash(datos, uid, cantidad)
     guardar_datos(datos)
 
-    await ctx.send(f"💸 Se removieron {cantidad} <:amatista:1420736192269390006> de {miembro.mention} (cash).")
+    await ctx.send(f"💸 Se removieron {cantidad} <:amatista:1420736192269390006> de {miembro.mention} ({tipo.lower()}).")
 
 
 # ------------------ COMANDOS BÁSICOS / ADMIN ------------------
@@ -2815,4 +2831,3 @@ async def lb(ctx):
 if __name__ == "__main__":
     # Pon tu token aquí de forma segura
     bot.run(os.getenv("DISCORD_TOKEN"))
-
