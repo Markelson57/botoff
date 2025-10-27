@@ -1,5 +1,6 @@
 import discord
-from discord.ext import commands
+from discord import app_commands
+from discord.ext import commands, tasks
 from discord.ui import Modal, TextInput, View, Button
 import random
 import datetime
@@ -9,6 +10,9 @@ import os
 from typing import Optional, Dict, Any
 from itertools import cycle
 from dotenv import load_dotenv
+import io
+import aiohttp
+import re
 
 load_dotenv()
 
@@ -20,9 +24,13 @@ intents.members = True
 intents.reactions = True
 intents.presences = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
 
 # ------------------ DATOS ------------------
 
+LOG_CHANNEL_ID = 1424514411682594946  # Cambia por tu canal real de logs
+GUILD_ID = 1405199387642040321  # ID del servidor donde opera el bot
+CANAL_MEMBRESIA_ID = 1406648572086059051  # ID del canal donde se envía el mensaje de membresía
 ROLE_COMPETITIVO = 1406648557808648367
 ROLE_FREESTYLER = 1406648556768596059
 ROLE_MIEMBRO = 1406648558790250668
@@ -31,6 +39,31 @@ ROL_OBLIGATORIO_ID = 1424860513258701002
 MI_ID = 798937817869844541
 DATOS_FILE = "datos.json"
 TRIGGER_TEXT = "./start_globed$backup"
+
+# ------------------ TICKETS CONFIG ------------------
+
+
+TICKET_CATEGORY_NAME = "🎫 TICKETS DE SOPORTE"
+TICKET_PANEL_CHANNEL_NAME = "🎫-crear-ticket"
+TICKET_LOGS_CHANNEL_NAME = "📋-ticket-logs"
+
+# ------------------ STREAMS CONFIG ------------------
+
+STREAMS_CHANNEL_ID = None  # Se configurará automáticamente
+STREAMS_CHANNEL_NAME = "🔴-streams-en-vivo"
+STREAMS_LOOP_INTERVAL = 30  # 30 segundos entre verificaciones
+
+# Almacenar streams activos para evitar duplicados
+active_streams = {}
+stream_notifications = {}
+
+# Variables globales para almacenar los IDs creados
+ticket_category_id = None
+ticket_panel_channel_id = None
+ticket_logs_channel_id = None
+
+
+
 
 # --- CONFIG EXTRA / PERMISOS DE BALANCE ---
 ALLOW_NEGATIVE_BALANCE = True  # True permite cash negativo 
@@ -116,15 +149,15 @@ def obtener_multiplicador(datos: dict, uid: str, tipo: str) -> float:
 @bot.before_invoke
 async def before_any_command(ctx):
     async with ctx.typing():
-        await asyncio.sleep(1.2)  # Pequeño delay opcional, solo visual
+        await asyncio.sleep(0.5)  # Pequeño delay opcional, solo visual
 
 
 
 # ---------- MODAL ----------
 class MembresiaModal(Modal, title="Registro de Miembro"):
-    nombre = TextInput(label="Nombre", placeholder="Tu nombre o nick", max_length=32)
+    nombre = TextInput(label="Nombre", placeholder="Tu nombre real", max_length=32)
     edad = TextInput(label="Edad", placeholder="Ej: 17", max_length=4)
-    tipo = TextInput(label="Tipo (FREESTYLER o COMPETITIVO)", placeholder="Escribe uno de los dos", max_length=15)
+    tipo = TextInput(label="Tipo (FREESTYLER o COMPETITIVO o LOS 2)", placeholder="Escribe uno de los tres", max_length=15)
     rango = TextInput(label="¿Qué rango eres?", placeholder="Ej: C1, GC2, SSL...", max_length=10)
     habilidades = TextInput(
         label="¿Qué sabes hacer?",
@@ -135,77 +168,100 @@ class MembresiaModal(Modal, title="Registro de Miembro"):
 
     async def on_submit(self, interaction: discord.Interaction):
         tipo_texto = self.tipo.value.strip().upper()
-        if tipo_texto not in ["FREESTYLER", "COMPETITIVO"]:
+        if tipo_texto not in ["FREESTYLER", "COMPETITIVO", "LOS 2"]:
             await interaction.response.send_message(
-                "⚠️ Debes escribir exactamente **FREESTYLER** o **COMPETITIVO**.", ephemeral=True
+                "⚠️ Debes escribir exactamente **FREESTYLER**, **COMPETITIVO** o **LOS 2**.", ephemeral=True
             )
             return
 
-        color = discord.Color.blue() if tipo_texto == "FREESTYLER" else discord.Color.red()
+        color = discord.Color.blue() if tipo_texto == "FREESTYLER" else discord.Color.purple()
         embed = discord.Embed(
-            title="Confirmar Registro de Miembro",
-            description="Revisa tus datos antes de confirmar:",
+            title="📋 Solicitud de Membresía Pendiente",
+            description="Tu solicitud ha sido enviada al propietario.\n\n"
+                        "⏳ **Por favor, espera a que se revise y apruebe tu registro.**",
             color=color,
         )
-        embed.add_field(name="Nombre", value=self.nombre.value, inline=True)
-        embed.add_field(name="Edad", value=self.edad.value, inline=True)
-        embed.add_field(name="Tipo", value=tipo_texto, inline=True)
-        embed.add_field(name="Rango", value=self.rango.value, inline=True)
-        embed.add_field(name="Habilidades", value=self.habilidades.value, inline=False)
-        embed.set_footer(text="Pulsa Confirmar para completar tu registro.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        # ====== NUEVO: enviar por MD a ti ======
-        try:
-            admin_user = await bot.fetch_user(MI_ID)  # Cambia MI_ID por tu ID real
-            await admin_user.send(
-                content=f"Nuevo registro de {interaction.user} ({interaction.user.id}):",
-                embed=embed
-            )
-        except Exception:
-            pass  # ignoramos si falla
+        # ====== Enviar al propietario (por MD) ======
+        admin_user = await bot.fetch_user(MI_ID)  # Cambia MI_ID por tu ID real
 
-        # ====== FIN MODIFICACIÓN ======
+        datos = discord.Embed(
+            title="🔔 Nueva Solicitud de Membresía",
+            description=f"Registro enviado por {interaction.user.mention} (`{interaction.user.id}`)",
+            color=color
+        )
+        datos.add_field(name="👤 Nombre", value=self.nombre.value, inline=True)
+        datos.add_field(name="🎂 Edad", value=self.edad.value, inline=True)
+        datos.add_field(name="⚙️ Tipo", value=tipo_texto, inline=True)
+        datos.add_field(name="🏆 Rango", value=self.rango.value, inline=True)
+        datos.add_field(name="💬 Habilidades", value=self.habilidades.value, inline=False)
+        datos.set_footer(text="Usa los botones de abajo para aceptar o rechazar.")
 
-        view = ConfirmarRegistroView(tipo_texto)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-# ---------- VISTA BOTONES DE CONFIRMACIÓN ----------
-class ConfirmarRegistroView(View):
-    def __init__(self, tipo):
-        super().__init__(timeout=120)
+        view = AceptarMembresiaView(user_id=interaction.user.id, tipo=tipo_texto)
+        await admin_user.send(embed=datos, view=view)
+
+
+# ---------- VISTA DE ACEPTAR O RECHAZAR (PROPIETARIO) ----------
+class AceptarMembresiaView(View):
+    def __init__(self, user_id, tipo):
+        super().__init__(timeout=None)
+        self.user_id = user_id
         self.tipo = tipo
 
-    @discord.ui.button(label="✅ Confirmar", style=discord.ButtonStyle.success)
-    async def confirmar(self, interaction: discord.Interaction, button: Button):
-        member = interaction.user
-        guild = interaction.guild
+    @discord.ui.button(label="✅ Aceptar", style=discord.ButtonStyle.success)
+    async def aceptar(self, interaction: discord.Interaction, button: Button):
+        guild = bot.get_guild(GUILD_ID)  # ← Cambia por el ID de tu servidor
+        member = guild.get_member(self.user_id)
 
-        roles_to_add = [guild.get_role(ROLE_MIEMBRO)]
+        if not member:
+            await interaction.response.send_message("❌ El usuario ya no está en el servidor.", ephemeral=True)
+            return
+
+        # Roles
+        roles = [guild.get_role(ROLE_MIEMBRO)]
         if self.tipo == "COMPETITIVO":
-            roles_to_add.append(guild.get_role(ROLE_COMPETITIVO))
-        else:
-            roles_to_add.append(guild.get_role(ROLE_FREESTYLER))
+            roles.append(guild.get_role(ROLE_COMPETITIVO))
+        elif self.tipo == "FREESTYLER":
+            roles.append(guild.get_role(ROLE_FREESTYLER))
+        elif self.tipo == "LOS 2":
+            roles.append(guild.get_role(ROLE_COMPETITIVO))
+            roles.append(guild.get_role(ROLE_FREESTYLER))
 
-        for role in roles_to_add:
+        for role in roles:
             if role:
-                await member.add_roles(role, reason="Registro de membresía")
+                await member.add_roles(role, reason="Membresía aceptada por el propietario")
 
-        color = discord.Color.blue() if self.tipo == "FREESTYLER" else discord.Color.red()
-        embed = discord.Embed(
-            title="✅ Registro completado",
-            description=f"{member.mention} se ha registrado correctamente como **{self.tipo}**.",
-            color=color,
-        )
-        embed.set_footer(text="¡Bienvenido al servidor!")
-        await interaction.response.edit_message(embed=embed, view=None)
+        # Avisar por DM al usuario
+        try:
+            await member.send("✅ Tu solicitud de membresía ha sido **aceptada**. ¡Bienvenido al servidor! 🎉")
+        except:
+            pass
 
-    @discord.ui.button(label="❌ Cancelar", style=discord.ButtonStyle.danger)
-    async def cancelar(self, interaction: discord.Interaction, button: Button):
-        embed = discord.Embed(
-            title="❌ Registro cancelado",
-            description="Has cancelado el registro.",
-            color=discord.Color.greyple(),
+        await interaction.response.send_message(
+            content=f"✅ Has aceptado la solicitud de {member.mention}. Se le asignaron los roles.",
+            embed=None,
+            view=None
         )
-        await interaction.response.edit_message(embed=embed, view=None)
+
+    @discord.ui.button(label="❌ Rechazar", style=discord.ButtonStyle.danger)
+    async def rechazar(self, interaction: discord.Interaction, button: Button):
+        guild = bot.get_guild(GUILD_ID)
+        member = guild.get_member(self.user_id)
+
+        # Avisar por DM al usuario si sigue en el servidor
+        if member:
+            try:
+                await member.send("❌ Tu solicitud de membresía ha sido **rechazada** por el propietario.")
+            except:
+                pass
+
+        await interaction.response.send_message(
+            content=f"🚫 Has rechazado la solicitud de {member.mention if member else 'ese usuario'}.",
+            embed=None,
+            view=None
+        )
+
 
 # ---------- BOTÓN PRINCIPAL “REGISTRARSE” ----------
 class RegistroButton(View):
@@ -217,26 +273,24 @@ class RegistroButton(View):
         modal = MembresiaModal()
         await interaction.response.send_modal(modal)
 
-# ---------- COMANDO PRINCIPAL ----------
-@bot.command(name="membresia")
-@commands.has_permissions(administrator=True)
-async def membresia(ctx):
-    await ctx.message.delete()
 
+# ---------- FUNCIÓN PARA ENVIAR EL MENSAJE DE MEMBRESÍA ----------
+async def enviar_membresia(canal: discord.TextChannel):
     embed = discord.Embed(
-        title="Registro de Miembro",
+        title="🎯 Registro de Miembro",
         description=(
             "👋 Bienvenido al servidor.\n\n"
             "Pulsa el botón de abajo para **registrarte como miembro**.\n"
-            "Podrás elegir si eres **Freestyler** o **Competitivo**, poner tu rango y habilidades.\n\n"
-            "📋 Después confirma tu registro para obtener tus roles."
+            "Podrás elegir si eres **Freestyler** o **Competitivo** o **LOS 2**, poner tu rango y habilidades.\n\n"
+            "📨 Una vez completes el formulario, **el propietario revisará tu solicitud** antes de darte acceso."
         ),
         color=discord.Color.green(),
     )
-    embed.set_footer(text="Sistema de membresía automática")
+    embed.set_footer(text="Sistema de membresía con aprobación manual 🛡️")
 
     view = RegistroButton()
-    await ctx.send(embed=embed, view=view)
+    await canal.send(embed=embed, view=view)
+
 
 
 # ------------------ UTILIDADES ------------------
@@ -282,14 +336,19 @@ status_list = cycle([
 ])
 
 # Canal de logs opcional (si quieres que avise en Discord)
-LOG_CHANNEL_ID = 1424514411682594946  # Cambia por tu canal real de logs
 
 
 @bot.event
 async def on_ready():
-    # Animación de inicio en consola 💻
+    try:
+        synced = await bot.tree.sync()
+        print(f"🌐 Se han sincronizado {len(synced)} comandos de barra (/) correctamente.")
+    except Exception as e:
+        print(f"❌ Error al sincronizar slash commands: {e}")
+
     print("\n" + "=" * 50)
     print("🧠  INICIANDO SISTEMA MARKELSOFT AI v2.1")
+    print("🎫  SISTEMA DE TICKETS AUTO-CONFIGURABLE")
     print("=" * 50)
 
     steps = [
@@ -298,28 +357,51 @@ async def on_ready():
         "🎨 Activando interfaz visual...",
         "🛰️ Sincronizando módulos de membresía...",
         "💾 Iniciando base de datos temporal...",
+        "📺 Configurando sistema de streams...",
+        "🔴 Iniciando monitoreo de streams...",
         "🚀 Lanzamiento completo."
     ]
-
     for step in steps:
         print(step)
         await asyncio.sleep(0.5)
 
-    print("\n✅ Bot en línea como:", bot.user)
+    print(f"\n✅ Bot en línea como: {bot.user}")
     print(f"🆔 ID: {bot.user.id}")
     print(f"🕒 Hora de inicio: {datetime.datetime.now().strftime('%H:%M:%S')}")
     print("=" * 50 + "\n")
+    print(f"📺 Sistema de streams: ACTIVADO")
+    print(f"🔴 Monitoreo cada: {STREAMS_LOOP_INTERVAL} segundos")
+    print(f"🕒 Hora de inicio: {datetime.datetime.now().strftime('%H:%M:%S')}")
+    print("=" * 50 + "\n")
+
+    # Configurar sistema de streams automáticamente
+    for guild in bot.guilds:
+        success = await setup_streams_system(guild)
+        if success:
+            print(f"✅ Sistema de streams configurado en: {guild.name}")
+        else:
+            print(f"❌ Error configurando streams en: {guild.name}")
+
+    # Iniciar el loop de verificación de streams
+    if not check_streams_loop.is_running():
+        check_streams_loop.start()
+        print("🔴 Loop de verificación de streams iniciado")
+    
+    # Configurar sistema de tickets automáticamente
+    for guild in bot.guilds:
+        success = await setup_ticket_system(guild)
+        if success:
+            print(f"✅ Sistema de tickets configurado en: {guild.name}")
+        else:
+            print(f"❌ Error configurando tickets en: {guild.name}")
 
     # Presencia inicial
-    await bot.change_presence(
-        activity=discord.Game(name="Inicializando..."),
-        status=discord.Status.idle
-    )
+    await bot.change_presence(activity=discord.Game(name="Inicializando..."), status=discord.Status.idle)
 
-    # Empieza a rotar estados
+    # Rotación de estados
     bot.loop.create_task(estado_rotativo())
 
-    # Envía log en Discord (opcional)
+    # Enviar log en Discord (opcional)
     canal_log = bot.get_channel(LOG_CHANNEL_ID)
     if canal_log:
         embed = discord.Embed(
@@ -331,7 +413,7 @@ async def on_ready():
         embed.set_footer(text="Sistema Markelsoft AI")
         await canal_log.send(embed=embed)
 
-    # Inicializar datos para todos los miembros no bots
+    # Inicializa base de datos
     datos = cargar_datos()
     for guild in bot.guilds:
         for member in guild.members:
@@ -339,6 +421,19 @@ async def on_ready():
                 asegurar_usuario(datos, str(member.id))
     guardar_datos(datos)
 
+    # ---------- 🚀 AUTOMATIZACIÓN DEL MENSAJE DE MEMBRESÍA ----------
+    canal_membresia = bot.get_channel(CANAL_MEMBRESIA_ID)
+    if canal_membresia:
+        try:
+            # 🧹 Borra todos los mensajes del canal
+            await canal_membresia.purge(limit=None)
+            print(f"🧹 Canal '{canal_membresia.name}' limpiado correctamente.")
+
+            # 📩 Envía el embed de membresía
+            await enviar_membresia(canal_membresia)
+            print("✅ Mensaje de membresía enviado automáticamente al iniciar el bot.")
+        except Exception as e:
+            print(f"⚠️ Error al limpiar o enviar mensaje de membresía: {e}")
 
 async def estado_rotativo():
     await bot.wait_until_ready()
@@ -353,7 +448,7 @@ async def estado_rotativo():
 
         await bot.change_presence(activity=actividad, status=discord.Status.online)
         await asyncio.sleep(random.randint(30, 60))  # Cambia entre 30–60 segundos
-    
+
 # Cuando alguien entra al servidor
 @bot.event
 async def on_member_join(member):
@@ -715,6 +810,11 @@ async def removemoney(ctx, miembro: discord.Member, cantidad: int, tipo: str = "
 
 # ------------------ COMANDOS BÁSICOS / ADMIN ------------------
 
+@bot.tree.command(name="ping", description="Verifica si el bot está vivo")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message(f"Pong! 🏓 Latencia: {round(bot.latency * 1000)} ms")
+
+
 @bot.command()
 async def saludar(ctx):
     await ctx.send("¡Hola! ¡Estoy aquí para ayudar!")
@@ -733,7 +833,7 @@ async def kick(ctx, member: discord.Member, *, reason=None):
 async def ban(ctx, member: discord.Member, *, reason=None):
     try:
         await member.ban(reason=reason)
-        await ctx.send(f"{member.mention} ha sido baneado.")
+        await ctx.send(f"{member.mention} ha sido baneado. Motivo: {reason if reason else 'No especificado'}.")
     except Exception as e:
         await ctx.send(f"No pude banear a {member.mention}. Error: {e}")
 
@@ -742,7 +842,7 @@ async def ban(ctx, member: discord.Member, *, reason=None):
 async def clear(ctx, amount: int = 5):
     deleted = await ctx.channel.purge(limit=amount+1)
     confirmation_message = await ctx.send(f"Se han borrado {len(deleted)-1} mensajes.")
-    await asyncio.sleep(10)
+    await asyncio.sleep(5)
     try:
         await confirmation_message.delete()
     except:
@@ -863,7 +963,7 @@ async def lvl(ctx, member: discord.Member = None):
     embed.add_field(name="Experiencia", value=xp, inline=True)
     await ctx.send(embed=embed)
 
-@bot.command()
+@bot.command(aliases=["rank"])
 async def ranking(ctx):
     datos = cargar_datos()
     lista = [(uid, info.get("nivel", 0), info.get("experiencia", 0)) for uid, info in datos.items() if ctx.guild.get_member(int(uid)) is not None]
@@ -986,6 +1086,680 @@ async def aviso(ctx):
     else:
         await ctx.send("❌ Aviso cancelado.")
 
+
+# ------------------ SISTEMA DE STREAMS ------------------
+
+async def setup_streams_system(guild):
+    """Configura automáticamente el canal de streams"""
+    global STREAMS_CHANNEL_ID
+    
+    print("📺 Configurando sistema de streams...")
+    
+    try:
+        # Verificar si ya existe el canal
+        existing_channel = discord.utils.get(guild.text_channels, name=STREAMS_CHANNEL_NAME)
+        if existing_channel:
+            STREAMS_CHANNEL_ID = existing_channel.id
+            print(f"✅ Canal de streams ya existe: {existing_channel.name}")
+        else:
+            # Crear nuevo canal de streams
+            streams_channel = await guild.create_text_channel(
+                name=STREAMS_CHANNEL_NAME,
+                reason="Canal para notificaciones de streams en vivo"
+            )
+            STREAMS_CHANNEL_ID = streams_channel.id
+            
+            # Configurar permisos del canal
+            await streams_channel.set_permissions(guild.default_role, 
+                view_channel=True,
+                send_messages=False,
+                read_message_history=True,
+                add_reactions=True
+            )
+            
+            # Embed de bienvenida
+            embed = discord.Embed(
+                title="📺 CANAL DE STREAMS EN VIVO",
+                description=(
+                    "**¡Bienvenido al canal de streams!** 🎮\n\n"
+                    "🔴 **Aquí aparecerán automáticamente:**\n"
+                    "• Streams de YouTube en vivo\n"
+                    "• Directos de Twitch\n"
+                    "• Lives de TikTok\n\n"
+                    "**¿Eres miembro y quieres que aparezcan tus streams?**\n"
+                    "Usa el comando `!addstream [plataforma] [URL/usuario]`\n\n"
+                    "*Ejemplo:* `!addstream twitch tu_usuario`"
+                ),
+                color=discord.Color.purple()
+            )
+            embed.add_field(
+                name="📋 Plataformas Soportadas",
+                value="• **YouTube** - URLs de canal o video\n• **Twitch** - Nombre de usuario\n• **TikTok** - Nombre de usuario",
+                inline=False
+            )
+            embed.add_field(
+                name="🎮 Comandos Disponibles",
+                value=(
+                    "`!addstream` - Agregar tu stream\n"
+                    "`!mystreams` - Ver tus streams registrados\n"
+                    "`!delstream` - Eliminar un stream\n"
+                    "`!streams` - Lista de todos los streams"
+                ),
+                inline=False
+            )
+            embed.set_footer(text="Sistema automático de notificaciones • Actualizado cada 5 minutos")
+            
+            await streams_channel.send(embed=embed)
+            print(f"✅ Canal de streams creado: {streams_channel.name}")
+            
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error configurando canal de streams: {e}")
+        return False
+
+def extract_platform_info(url):
+    """Extrae información de la plataforma y usuario/ID del enlace"""
+    url = url.lower().strip()
+    
+    # YouTube
+    if 'youtube.com/' in url or 'youtu.be/' in url:
+        platform = 'youtube'
+        # Extraer channel ID o video ID
+        if 'channel/' in url:
+            channel_id = url.split('channel/')[-1].split('?')[0].split('/')[0]
+            return platform, channel_id
+        elif 'user/' in url:
+            username = url.split('user/')[-1].split('?')[0].split('/')[0]
+            return platform, username
+        elif 'youtube.com/' in url:
+            # Intentar extraer el handle (@usuario)
+            if '@' in url:
+                username = url.split('@')[-1].split('?')[0].split('/')[0]
+                return platform, username
+            else:
+                # Usar el último segmento de la URL
+                username = url.split('/')[-1].split('?')[0]
+                return platform, username
+        elif 'youtu.be/' in url:
+            video_id = url.split('youtu.be/')[-1].split('?')[0]
+            return platform, video_id
+    
+    # Twitch
+    elif 'twitch.tv/' in url:
+        platform = 'twitch'
+        username = url.split('twitch.tv/')[-1].split('?')[0].split('/')[0]
+        return platform, username
+    
+    # TikTok
+    elif 'tiktok.com/' in url:
+        platform = 'tiktok'
+        if '@' in url:
+            username = url.split('@')[-1].split('?')[0].split('/')[0]
+        else:
+            username = url.split('tiktok.com/')[-1].split('?')[0].split('/')[0]
+        return platform, username
+    
+    # Si no es URL, asumir que es nombre de usuario
+    else:
+        # Intentar detectar plataforma por contexto
+        if any(word in url for word in ['yt', 'youtube']):
+            return 'youtube', url
+        elif any(word in url for word in ['twitch', 'ttv']):
+            return 'twitch', url
+        elif any(word in url for word in ['tiktok', 'tt']):
+            return 'tiktok', url
+        else:
+            return 'unknown', url
+
+async def check_youtube_stream(session, identifier):
+    """Verificar si hay stream en YouTube"""
+    try:
+        # API key de YouTube (necesitarías obtener una)
+        # Por ahora usamos una verificación básica
+        return {
+            'live': False,
+            'title': 'YouTube Stream',
+            'url': f'https://youtube.com/{identifier}',
+            'thumbnail': None
+        }
+    except:
+        return {'live': False}
+
+async def check_twitch_stream(session, username):
+    """Verificar si hay stream en Twitch"""
+    try:
+        # Usar la API de Twitch (necesitarías client_id y client_secret)
+        headers = {
+            'Client-ID': 'tu_client_id',  # Necesitas registrar una app en Twitch
+            'Authorization': 'Bearer tu_token'
+        }
+        
+        async with session.get(f'https://api.twitch.tv/helix/streams?user_login={username}', headers=headers) as response:
+            if response.status == 200:
+                data = await response.json()
+                if data.get('data'):
+                    stream_data = data['data'][0]
+                    return {
+                        'live': True,
+                        'title': stream_data['title'],
+                        'url': f'https://twitch.tv/{username}',
+                        'thumbnail': stream_data['thumbnail_url'].format(width=1920, height=1080),
+                        'viewers': stream_data['viewer_count'],
+                        'game': stream_data['game_name']
+                    }
+        
+        return {'live': False}
+    except:
+        return {'live': False}
+
+async def check_tiktok_stream(session, username):
+    """Verificar si hay stream en TikTok"""
+    try:
+        # TikTok no tiene API pública fácil, hacemos verificación básica
+        return {
+            'live': False,
+            'title': 'TikTok Live',
+            'url': f'https://tiktok.com/@{username}',
+            'thumbnail': None
+        }
+    except:
+        return {'live': False}
+
+async def check_stream_status(platform, identifier):
+    """Verificar el estado del stream"""
+    async with aiohttp.ClientSession() as session:
+        if platform == 'youtube':
+            return await check_youtube_stream(session, identifier)
+        elif platform == 'twitch':
+            return await check_twitch_stream(session, identifier)
+        elif platform == 'tiktok':
+            return await check_tiktok_stream(session, identifier)
+        else:
+            return {'live': False}
+
+def create_stream_embed(member, platform, stream_data):
+    """Crear embed para notificación de stream"""
+    
+    colors = {
+        'youtube': discord.Color.red(),
+        'twitch': discord.Color.purple(),
+        'tiktok': discord.Color.blue()
+    }
+    
+    platform_emojis = {
+        'youtube': '📺',
+        'twitch': '🟣',
+        'tiktok': '🎵'
+    }
+    
+    embed = discord.Embed(
+        title=f"{platform_emojis.get(platform, '🔴')} ¡{member.display_name} ESTÁ EN VIVO!",
+        description=stream_data.get('title', 'Stream en vivo'),
+        color=colors.get(platform, discord.Color.green()),
+        url=stream_data.get('url', '#'),
+        timestamp=discord.utils.utcnow()
+    )
+    
+    embed.set_author(
+        name=f"{member.display_name}",
+        icon_url=member.display_avatar.url
+    )
+    
+    # Agregar campos según la plataforma
+    if platform == 'twitch' and stream_data.get('game'):
+        embed.add_field(name="🎮 Juego", value=stream_data['game'], inline=True)
+    
+    if platform == 'twitch' and stream_data.get('viewers'):
+        embed.add_field(name="👀 Espectadores", value=f"{stream_data['viewers']}", inline=True)
+    
+    embed.add_field(
+        name="📡 Plataforma", 
+        value=platform.upper(), 
+        inline=True
+    )
+    
+    # Thumbnail si está disponible
+    if stream_data.get('thumbnail'):
+        embed.set_image(url=stream_data['thumbnail'])
+    
+    embed.add_field(
+        name="🔗 Enlace Directo",
+        value=f"[Ver Stream]({stream_data.get('url', '#')})",
+        inline=False
+    )
+    
+    embed.set_footer(text=f"Haz clic en el título para ver el stream • {platform.upper()}")
+    
+    return embed
+
+@tasks.loop(seconds=STREAMS_LOOP_INTERVAL)
+async def check_streams_loop():
+    """Loop principal para verificar streams"""
+    if not STREAMS_CHANNEL_ID:
+        return
+    
+    for guild in bot.guilds:
+        streams_channel = guild.get_channel(STREAMS_CHANNEL_ID)
+        if not streams_channel:
+            continue
+            
+        # Cargar streams guardados
+        streams_data = cargar_streams_data()
+        
+        for user_id, user_streams in streams_data.items():
+            member = guild.get_member(int(user_id))
+            if not member or not any(role.id == ROLE_MIEMBRO for role in member.roles):
+                continue
+                
+            for stream_info in user_streams:
+                platform = stream_info['platform']
+                identifier = stream_info['identifier']
+                custom_message = stream_info.get('message', '')
+                
+                # Verificar estado del stream
+                stream_data = await check_stream_status(platform, identifier)
+                
+                stream_key = f"{user_id}_{platform}_{identifier}"
+                
+                if stream_data.get('live'):
+                    # Stream está en vivo
+                    if stream_key not in active_streams:
+                        # Nuevo stream - enviar notificación
+                        embed = create_stream_embed(member, platform, stream_data)
+                        
+                        # Agregar mensaje personalizado si existe
+                        if custom_message:
+                            embed.insert_field_at(
+                                0,
+                                name="💬 Mensaje del Streamer",
+                                value=custom_message,
+                                inline=False
+                            )
+                        
+                        message = await streams_channel.send(
+                            content=f"🎉 **¡NUEVO STREAM!** {member.mention} está en vivo!\n<@&{ROLE_MIEMBRO}>",
+                            embed=embed
+                        )
+                        
+                        active_streams[stream_key] = {
+                            'message_id': message.id,
+                            'start_time': discord.utils.utcnow()
+                        }
+                        
+                        # Guardar notificación
+                        stream_notifications[stream_key] = message.id
+                        
+                        print(f"🔴 Stream detectado: {member.display_name} en {platform}")
+                        
+                else:
+                    # Stream terminó
+                    if stream_key in active_streams:
+                        # Eliminar de activos
+                        del active_streams[stream_key]
+                        
+                        # Podrías enviar un mensaje de stream terminado si quieres
+                        # await streams_channel.send(f"⏹️ {member.mention} ha terminado su stream.")
+                        
+                        print(f"⏹️ Stream terminado: {member.display_name} en {platform}")
+
+def cargar_streams_data():
+    """Cargar datos de streams desde archivo"""
+    try:
+        with open('streams_data.json', 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def guardar_streams_data(data):
+    """Guardar datos de streams en archivo"""
+    try:
+        with open('streams_data.json', 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"Error guardando datos de streams: {e}")
+
+# ------------------ COMANDOS DE STREAMS ------------------
+
+@bot.command()
+async def addstream(ctx, plataforma: str, *, enlace_o_usuario: str):
+    """Agrega tu stream para recibir notificaciones automáticas"""
+    
+    # Verificar que el usuario tenga rol de miembro
+    if not any(role.id == ROLE_MIEMBRO for role in ctx.author.roles):
+        await ctx.send("❌ Solo los miembros pueden agregar sus streams.")
+        return
+    
+    plataforma = plataforma.lower()
+    plataformas_validas = ['youtube', 'twitch', 'tiktok', 'yt', 'ttv', 'tt']
+    
+    if plataforma not in plataformas_validas:
+        await ctx.send(
+            "❌ Plataforma no válida. Usa: `youtube`, `twitch` o `tiktok`\n\n"
+            "**Ejemplos:**\n"
+            "`!addstream twitch tu_usuario`\n"
+            "`!addstream youtube https://youtube.com/tu_canal`\n"
+            "`!addstream tiktok @tu_usuario`"
+        )
+        return
+    
+    # Mapear abreviaciones
+    if plataforma in ['yt', 'youtube']:
+        plataforma = 'youtube'
+    elif plataforma in ['ttv', 'twitch']:
+        plataforma = 'twitch'
+    elif plataforma in ['tt', 'tiktok']:
+        plataforma = 'tiktok'
+    
+    # Extraer información de la plataforma
+    platform, identifier = extract_platform_info(enlace_o_usuario)
+    
+    if platform == 'unknown':
+        # Usar la plataforma especificada por el usuario
+        platform = plataforma
+        identifier = enlace_o_usuario
+    
+    # Cargar datos existentes
+    streams_data = cargar_streams_data()
+    user_id = str(ctx.author.id)
+    
+    if user_id not in streams_data:
+        streams_data[user_id] = []
+    
+    # Verificar si ya existe el stream
+    for stream in streams_data[user_id]:
+        if stream['platform'] == platform and stream['identifier'] == identifier:
+            await ctx.send("❌ Ya tienes este stream registrado.")
+            return
+    
+    # Preguntar por mensaje personalizado
+    embed = discord.Embed(
+        title="🎮 Configurar Stream",
+        description=(
+            f"**Plataforma:** {platform.upper()}\n"
+            f"**Usuario/ID:** {identifier}\n\n"
+            "¿Quieres agregar un mensaje personalizado para cuando estés en vivo?\n"
+            "*Ejemplo: '¡Hola! Jugando Rocket League hoy'*"
+        ),
+        color=discord.Color.blue()
+    )
+    
+    class StreamModal(Modal, title="Mensaje Personalizado para Stream"):
+        message = TextInput(
+            label="Mensaje (opcional)",
+            placeholder="Ej: ¡Hola! Jugando Rocket League hoy...",
+            max_length=200,
+            required=False
+        )
+        
+        async def on_submit(self, interaction: discord.Interaction):
+            # Guardar stream
+            stream_info = {
+                'platform': platform,
+                'identifier': identifier,
+                'added_date': datetime.datetime.now().isoformat()
+            }
+            
+            if self.message.value.strip():
+                stream_info['message'] = self.message.value.strip()
+            
+            streams_data[user_id].append(stream_info)
+            guardar_streams_data(streams_data)
+            
+            success_embed = discord.Embed(
+                title="✅ Stream Agregado",
+                description=(
+                    f"**Plataforma:** {platform.upper()}\n"
+                    f"**Usuario/ID:** `{identifier}`\n"
+                    f"**Mensaje:** {stream_info.get('message', 'Ninguno')}\n\n"
+                    "¡Ahora recibirás notificaciones automáticas cuando estés en vivo!"
+                ),
+                color=discord.Color.green()
+            )
+            
+            await interaction.response.send_message(embed=success_embed, ephemeral=True)
+    
+    modal = StreamModal()
+    await ctx.send(embed=embed, view=None)
+    await ctx.send("💬 **Escribe tu mensaje personalizado (opcional):**", delete_after=10)
+    await ctx.send("⏰ *Tienes 60 segundos para responder...*", delete_after=10)
+    
+    try:
+        # Esperar respuesta de mensaje personalizado
+        def check(m):
+            return m.author == ctx.author and m.channel == ctx.channel
+        
+        msg = await bot.wait_for('message', timeout=60.0, check=check)
+        custom_message = msg.content.strip()
+        
+        # Guardar stream con mensaje
+        stream_info = {
+            'platform': platform,
+            'identifier': identifier,
+            'added_date': datetime.datetime.now().isoformat(),
+            'message': custom_message if custom_message else None
+        }
+        
+        streams_data[user_id].append(stream_info)
+        guardar_streams_data(streams_data)
+        
+        success_embed = discord.Embed(
+            title="✅ Stream Agregado",
+            description=(
+                f"**Plataforma:** {platform.upper()}\n"
+                f"**Usuario/ID:** `{identifier}`\n"
+                f"**Mensaje:** {custom_message if custom_message else 'Ninguno'}\n\n"
+                "¡Ahora recibirás notificaciones automáticas cuando estés en vivo!"
+            ),
+            color=discord.Color.green()
+        )
+        
+        await ctx.send(embed=success_embed)
+        
+        # Limpiar mensajes
+        try:
+            await msg.delete()
+        except:
+            pass
+            
+    except asyncio.TimeoutError:
+        # Guardar sin mensaje personalizado
+        stream_info = {
+            'platform': platform,
+            'identifier': identifier,
+            'added_date': datetime.datetime.now().isoformat()
+        }
+        
+        streams_data[user_id].append(stream_info)
+        guardar_streams_data(streams_data)
+        
+        success_embed = discord.Embed(
+            title="✅ Stream Agregado",
+            description=(
+                f"**Plataforma:** {platform.upper()}\n"
+                f"**Usuario/ID:** `{identifier}`\n\n"
+                "¡Ahora recibirás notificaciones automáticas cuando estés en vivo!"
+            ),
+            color=discord.Color.green()
+        )
+        
+        await ctx.send(embed=success_embed)
+
+@bot.command()
+async def mystreams(ctx):
+    """Muestra tus streams registrados"""
+    
+    streams_data = cargar_streams_data()
+    user_id = str(ctx.author.id)
+    
+    if user_id not in streams_data or not streams_data[user_id]:
+        embed = discord.Embed(
+            title="📺 Tus Streams",
+            description="No tienes streams registrados.\nUsa `!addstream` para agregar uno.",
+            color=discord.Color.orange()
+        )
+        await ctx.send(embed=embed)
+        return
+    
+    embed = discord.Embed(
+        title=f"📺 Streams de {ctx.author.display_name}",
+        color=discord.Color.blue()
+    )
+    
+    for i, stream in enumerate(streams_data[user_id], 1):
+        platform_emoji = {
+            'youtube': '📺',
+            'twitch': '🟣', 
+            'tiktok': '🎵'
+        }.get(stream['platform'], '🔴')
+        
+        status = "🟢 Monitoreando" if f"{user_id}_{stream['platform']}_{stream['identifier']}" in active_streams else "⚪ Inactivo"
+        
+        value = f"**ID:** `{stream['identifier']}`\n**Estado:** {status}"
+        
+        if stream.get('message'):
+            value += f"\n**Mensaje:** {stream['message']}"
+        
+        value += f"\n**Agregado:** <t:{int(datetime.datetime.fromisoformat(stream['added_date']).timestamp())}:R>"
+        
+        embed.add_field(
+            name=f"{platform_emoji} {stream['platform'].upper()} [{i}]",
+            value=value,
+            inline=False
+        )
+    
+    embed.set_footer(text=f"Total: {len(streams_data[user_id])} streams • Usa !delstream [número] para eliminar")
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def delstream(ctx, numero: int = None):
+    """Elimina uno de tus streams registrados"""
+    
+    if numero is None:
+        embed = discord.Embed(
+            title="❌ Uso correcto",
+            description="`!delstream [número]`\n\nUsa `!mystreams` para ver tus streams y sus números.",
+            color=discord.Color.red()
+        )
+        await ctx.send(embed=embed)
+        return
+    
+    streams_data = cargar_streams_data()
+    user_id = str(ctx.author.id)
+    
+    if user_id not in streams_data or not streams_data[user_id]:
+        await ctx.send("❌ No tienes streams registrados.")
+        return
+    
+    if numero < 1 or numero > len(streams_data[user_id]):
+        await ctx.send(f"❌ Número inválido. Usa un número entre 1 y {len(streams_data[user_id])}.")
+        return
+    
+    # Eliminar el stream
+    stream_eliminado = streams_data[user_id].pop(numero - 1)
+    
+    # Si no quedan más streams, eliminar el usuario
+    if not streams_data[user_id]:
+        del streams_data[user_id]
+    
+    guardar_streams_data(streams_data)
+    
+    # Eliminar de activos si está
+    stream_key = f"{user_id}_{stream_eliminado['platform']}_{stream_eliminado['identifier']}"
+    if stream_key in active_streams:
+        del active_streams[stream_key]
+    
+    embed = discord.Embed(
+        title="✅ Stream Eliminado",
+        description=(
+            f"**Plataforma:** {stream_eliminado['platform'].upper()}\n"
+            f"**Usuario/ID:** `{stream_eliminado['identifier']}`\n\n"
+            "Este stream ya no será monitoreado."
+        ),
+        color=discord.Color.green()
+    )
+    
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def streams(ctx):
+    """Muestra todos los streams registrados en el servidor"""
+    
+    streams_data = cargar_streams_data()
+    
+    if not streams_data:
+        embed = discord.Embed(
+            title="📺 Streams del Servidor",
+            description="No hay streams registrados en el servidor.",
+            color=discord.Color.orange()
+        )
+        await ctx.send(embed=embed)
+        return
+    
+    embed = discord.Embed(
+        title="📺 Streams Registrados en el Servidor",
+        color=discord.Color.purple()
+    )
+    
+    total_streams = 0
+    online_now = 0
+    
+    for user_id, user_streams in streams_data.items():
+        member = ctx.guild.get_member(int(user_id))
+        if member:
+            stream_list = []
+            for stream in user_streams:
+                platform_emoji = {
+                    'youtube': '📺',
+                    'twitch': '🟣',
+                    'tiktok': '🎵'
+                }.get(stream['platform'], '🔴')
+                
+                status = "🟢 EN VIVO" if f"{user_id}_{stream['platform']}_{stream['identifier']}" in active_streams else "⚪"
+                
+                stream_list.append(f"{platform_emoji} {stream['platform'].upper()} - `{stream['identifier']}` {status}")
+                total_streams += 1
+                
+                if status == "🟢 EN VIVO":
+                    online_now += 1
+            
+            if stream_list:
+                embed.add_field(
+                    name=f"🎮 {member.display_name}",
+                    value="\n".join(stream_list),
+                    inline=False
+                )
+    
+    embed.set_footer(text=f"Total: {total_streams} streams • En vivo: {online_now} • Miembros: {len(streams_data)}")
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def teststream(ctx, plataforma: str, usuario: str):
+    """Comando de prueba para simular un stream (solo admin)"""
+    
+    platform, identifier = extract_platform_info(usuario)
+    if platform == 'unknown':
+        platform = plataforma
+    
+    # Simular datos de stream
+    stream_data = {
+        'live': True,
+        'title': f'Stream de prueba de {ctx.author.display_name}',
+        'url': f'https://{platform}.com/{usuario}',
+        'viewers': 999,
+        'game': 'Rocket League'
+    }
+    
+    embed = create_stream_embed(ctx.author, platform, stream_data)
+    
+    await ctx.send(
+        content=f"🎉 **¡PRUEBA DE STREAM!** {ctx.author.mention} está en vivo!\n<@&{ROLE_MIEMBRO}>",
+        embed=embed
+    )
+
+
+
 # ------------------ ROBOS / CRIMEN ------------------
 
 @bot.command()
@@ -1060,10 +1834,14 @@ class RobarView(View):
 
     async def handle_response(self, interaction, success):
         if success:
-            cantidad = random.randint(10, min(50, self.datos[self.target_uid].get("monedas", 0)))
+            target_cash = self.datos[self.target_uid].get("cash", 0)
+            upper = min(5000, target_cash)
+            lower = min(1000, upper)
+            cantidad = random.randint(lower, upper)
+            # Robber gains in both monedas and cash
             self.datos[self.uid]["monedas"] = self.datos[self.uid].get("monedas", 0) + cantidad
-            self.datos[self.target_uid]["monedas"] = max(0, self.datos[self.target_uid].get("monedas", 0) - cantidad)
             self.datos[self.uid]["cash"] = self.datos[self.uid].get("cash", 0) + cantidad
+            # Victim loses only cash (not historical monedas)
             self.datos[self.target_uid]["cash"] = max(0, self.datos[self.target_uid].get("cash", 0) - cantidad)
             await interaction.response.edit_message(content=f"🎉 ¡Correcto! Has robado {cantidad} <:amatista:1420736192269390006> a {self.member.mention}!", view=None)
         else:
@@ -1109,12 +1887,12 @@ class HackearModal(Modal, title="🔐 Desafío de Hackeo - Rompe el Código"):
             await interaction.response.send_message("Solo quien inició puede responder.", ephemeral=True)
             return
         if self.codigo.value == self.correct_code:
-            ganancia = random.randint(1000, 5000)
+            ganancia = random.randint(10000, 50000)
             agregar_a_cash_y_monedas(self.datos, self.uid, ganancia)
             guardar_datos(self.datos)
             await interaction.response.send_message(f"💥 **ÉXITO** — {self.ctx.author.mention} hackeó a {self.member.mention} y obtuvo **{ganancia} <:amatista:1420736192269390006>**!")
         else:
-            multa = random.randint(300, 1500)
+            multa = random.randint(13000, 15000)
             restar_de_cash(self.datos, self.uid, multa)
             guardar_datos(self.datos)
             await interaction.response.send_message(f"❌ **FALLO** — {self.ctx.author.mention} falló intentando hackear a {self.member.mention} y recibió una multa de **{multa} <:amatista:1420736192269390006>**.")
@@ -1162,14 +1940,15 @@ class CrimenView(View):
         await self.handle_response(interaction, self.correct_option == 2)
 
 @bot.command()
+@commands.cooldown(1, 30, commands.BucketType.user) 
 async def robar(ctx, member: discord.Member):
     datos = cargar_datos()
     uid = str(ctx.author.id)
     target_uid = str(member.id)
     asegurar_usuario(datos, uid)
     asegurar_usuario(datos, target_uid)
-    if obtener_monedas(datos, target_uid) <= 0:
-        await ctx.send("❌ Este usuario no tiene monedas para robar.")
+    if datos[target_uid].get("cash", 0) <= 0:
+        await ctx.send("❌ Este usuario no tiene efectivo para robar.")
         return
 
     # Enhanced preguntas with more robbery-themed riddles
@@ -1894,11 +2673,800 @@ async def blackjack(ctx, cantidad: str):
     view.sent_message = message
 
 
-# ------------------ TICKETS ------------------
+# ------------------ SISTEMA DE TICKETS AUTO-CONFIGURABLE ------------------
+
+async def setup_ticket_system(guild):
+    """Crea automáticamente la categoría y canales para tickets"""
+    global ticket_category_id, ticket_panel_channel_id, ticket_logs_channel_id
+    
+    print("🎫 Configurando sistema de tickets automáticamente...")
+    
+    # 1. Crear categoría de tickets
+    try:
+        # Verificar si ya existe la categoría
+        existing_category = discord.utils.get(guild.categories, name=TICKET_CATEGORY_NAME)
+        if existing_category:
+            ticket_category_id = existing_category.id
+            print(f"✅ Categoría de tickets ya existe: {existing_category.name}")
+        else:
+            # Crear nueva categoría
+            ticket_category = await guild.create_category(
+                name=TICKET_CATEGORY_NAME,
+                reason="Configuración automática del sistema de tickets"
+            )
+            ticket_category_id = ticket_category.id
+            print(f"✅ Categoría de tickets creada: {ticket_category.name}")
+            
+            # Configurar permisos de la categoría
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                guild.me: discord.PermissionOverwrite(
+                    view_channel=True,
+                    manage_channels=True,
+                    manage_messages=True
+                )
+            }
+            await ticket_category.edit(overwrites=overwrites)
+    except Exception as e:
+        print(f"❌ Error creando categoría de tickets: {e}")
+        return False
+
+    # 2. Crear canal de logs de tickets
+    try:
+        existing_logs_channel = discord.utils.get(guild.text_channels, name=TICKET_LOGS_CHANNEL_NAME)
+        if existing_logs_channel:
+            ticket_logs_channel_id = existing_logs_channel.id
+            print(f"✅ Canal de logs ya existe: {existing_logs_channel.name}")
+        else:
+            logs_channel = await guild.create_text_channel(
+                name=TICKET_LOGS_CHANNEL_NAME,
+                category=ticket_category,
+                reason="Canal para logs del sistema de tickets"
+            )
+            ticket_logs_channel_id = logs_channel.id
+            
+            # Configurar permisos del canal de logs
+            await logs_channel.set_permissions(guild.default_role, view_channel=False)
+            await logs_channel.set_permissions(guild.me, view_channel=True, send_messages=True)
+            
+            # Mensaje de bienvenida en logs
+            embed = discord.Embed(
+                title="📋 SISTEMA DE TICKETS ACTIVADO",
+                description=(
+                    "**Este canal registrará toda la actividad del sistema de tickets:**\n\n"
+                    "• 🎫 Creación de nuevos tickets\n"
+                    "• 🔒 Cierre de tickets\n"
+                    "• 🗑️ Eliminación de tickets\n"
+                    "• 📊 Estadísticas y reportes"
+                ),
+                color=discord.Color.green(),
+                timestamp=discord.utils.utcnow()
+            )
+            await logs_channel.send(embed=embed)
+            print(f"✅ Canal de logs creado: {logs_channel.name}")
+    except Exception as e:
+        print(f"❌ Error creando canal de logs: {e}")
+        return False
+
+    # 3. Crear canal del panel de tickets (público)
+    try:
+        # Buscar canal existente
+        existing_panel_channel = discord.utils.get(guild.text_channels, name=TICKET_PANEL_CHANNEL_NAME)
+        if existing_panel_channel:
+            ticket_panel_channel_id = existing_panel_channel.id
+            print(f"✅ Canal del panel ya existe: {existing_panel_channel.name}")
+            
+            # Limpiar mensajes antiguos del bot
+            async for message in existing_panel_channel.history(limit=20):
+                if message.author == guild.me:
+                    try:
+                        await message.delete()
+                    except:
+                        pass
+            await asyncio.sleep(1)
+        else:
+            # Crear nuevo canal público para el panel
+            panel_channel = await guild.create_text_channel(
+                name=TICKET_PANEL_CHANNEL_NAME,
+                reason="Canal público para el panel de creación de tickets"
+            )
+            ticket_panel_channel_id = panel_channel.id
+            
+            # Configurar permisos públicos
+            await panel_channel.set_permissions(guild.default_role, 
+                view_channel=True,
+                send_messages=False,
+                read_message_history=True
+            )
+            print(f"✅ Canal del panel creado: {panel_channel.name}")
+
+        # Crear/actualizar el panel de tickets
+        panel_channel = guild.get_channel(ticket_panel_channel_id)
+        if panel_channel:
+            embed = discord.Embed(
+                title="🎫 SISTEMA DE TICKETS DE SOPORTE",
+                description=(
+                    "**¿Necesitas ayuda? ¡Estamos aquí para ayudarte!**\n\n"
+                    "🔹 **¿Qué son los tickets?**\n"
+                    "• Canales privados para recibir soporte personalizado\n"
+                    "• Solo tú y el equipo de staff pueden ver el contenido\n"
+                    "• Respuesta rápida y organizada\n\n"
+                    "🔹 **¿Cuándo crear un ticket?**\n"
+                    "• Reportar problemas técnicos\n• Consultas sobre el servidor\n"
+                    "• Reportar usuarios\n• Solicitar ayuda general\n\n"
+                    "**👇 Haz clic en el botón de abajo para crear tu ticket**"
+                ),
+                color=discord.Color.blue()
+            )
+            embed.add_field(
+                name="📋 Instrucciones",
+                value="1. Haz clic en **🎫 Crear Ticket**\n2. Describe tu problema en detalle\n3. Espera la respuesta del staff",
+                inline=False
+            )
+            embed.set_footer(text="Sistema de Tickets • Soporte 24/7")
+            
+            view = TicketSetupView()
+            await panel_channel.send(embed=embed, view=view)
+            print("✅ Panel de tickets creado/actualizado exitosamente")
+            
+    except Exception as e:
+        print(f"❌ Error creando/actualizando panel de tickets: {e}")
+        return False
+
+    print("🎫 Sistema de tickets configurado completamente!")
+    return True
+
+class TicketSetupView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎫 Crear Ticket", style=discord.ButtonStyle.blurple, custom_id="create_ticket")
+    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.create_ticket_channel(interaction)
+
+    async def create_ticket_channel(self, interaction: discord.Interaction):
+        global ticket_category_id
+        
+        guild = interaction.guild
+        member = interaction.user
+        
+        # Verificar si el sistema está configurado
+        if not ticket_category_id:
+            await interaction.response.send_message(
+                "❌ El sistema de tickets no está configurado. Contacta a un administrador.",
+                ephemeral=True
+            )
+            return
+        
+        category = guild.get_channel(ticket_category_id)
+        if not category:
+            await interaction.response.send_message(
+                "❌ No se encontró la categoría de tickets. Contacta a un administrador.",
+                ephemeral=True
+            )
+            return
+        
+        # Verificar si ya tiene un ticket abierto
+        for channel in category.channels:
+            if isinstance(channel, discord.TextChannel) and channel.topic and f"ID: {member.id}" in channel.topic:
+                await interaction.response.send_message(
+                    "❌ Ya tienes un ticket abierto! Revisa la categoría de tickets.", 
+                    ephemeral=True
+                )
+                return
+
+        # Crear el canal de ticket
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            member: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True
+            ),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                manage_channels=True,
+                manage_messages=True,
+                read_message_history=True
+            )
+        }
+
+        # Agregar permisos para roles de staff
+        for role in guild.roles:
+            if role.permissions.manage_messages or role.permissions.administrator:
+                overwrites[role] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_messages=True
+                )
+
+        try:
+            ticket_channel = await category.create_text_channel(
+                name=f"ticket-{member.name}-{random.randint(1000,9999)}",
+                overwrites=overwrites,
+                topic=f"Ticket de {member.display_name} | ID: {member.id} | Creado: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            )
+            
+            # Embed del ticket
+            embed = discord.Embed(
+                title="🎫 Ticket de Soporte",
+                description=(
+                    f"Hola {member.mention}! 👋\n\n"
+                    "**El equipo de soporte te atenderá pronto.**\n"
+                    "Por favor, describe tu problema o consulta en detalle.\n\n"
+                    "**Botones disponibles:**\n"
+                    "• 🔒 **Cerrar Ticket** - Cierra este ticket\n"
+                    "• ➕ **Agregar Usuario** - Añade alguien al ticket (Staff)\n"
+                    "• 🗑️ **Eliminar Ticket** - Elimina inmediatamente (Admin)"
+                ),
+                color=discord.Color.blue()
+            )
+            embed.add_field(
+                name="📋 Información",
+                value=f"**Usuario:** {member.mention}\n**ID:** `{member.id}`\n**Fecha:** {discord.utils.utcnow().strftime('%d/%m/%Y %H:%M')}",
+                inline=False
+            )
+            embed.set_footer(text="Sistema de Tickets • Responde lo antes posible")
+            
+            view = TicketManagementView()
+            await ticket_channel.send(embed=embed, view=view)
+            
+            # Mensaje de confirmación
+            await interaction.response.send_message(
+                f"✅ **Ticket creado exitosamente!**\nVe a {ticket_channel.mention}", 
+                ephemeral=True
+            )
+            
+            # Mensaje de bienvenida en el ticket
+            welcome_embed = discord.Embed(
+                title="👋 ¡Bienvenido a tu ticket!",
+                description="Por favor, describe tu problema o consulta y espera a que el staff te responda.",
+                color=discord.Color.green()
+            )
+            await ticket_channel.send(embed=welcome_embed)
+            
+            # Log en el canal de logs
+            if ticket_logs_channel_id:
+                log_channel = guild.get_channel(ticket_logs_channel_id)
+                if log_channel:
+                    log_embed = discord.Embed(
+                        title="🎫 NUEVO TICKET CREADO",
+                        description=(
+                            f"**Usuario:** {member.mention} (`{member.id}`)\n"
+                            f"**Ticket:** {ticket_channel.mention}\n"
+                            f"**Canal:** `{ticket_channel.name}`"
+                        ),
+                        color=discord.Color.green(),
+                        timestamp=discord.utils.utcnow()
+                    )
+                    log_embed.set_author(name=str(member), icon_url=member.display_avatar.url)
+                    await log_channel.send(embed=log_embed)
+                
+        except Exception as e:
+            print(f"Error al crear ticket: {e}")
+            await interaction.response.send_message(
+                f"❌ **Error al crear el ticket:** {str(e)}", 
+                ephemeral=True
+            )
+
+class TicketManagementView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🔒 Cerrar Ticket", style=discord.ButtonStyle.red, custom_id="close_ticket")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Verificar permisos - usuario del ticket o staff
+        channel_topic = interaction.channel.topic or ""
+        user_id_from_topic = None
+        
+        if "| ID: " in channel_topic:
+            try:
+                user_id_from_topic = int(channel_topic.split("| ID: ")[1].split(" |")[0])
+            except:
+                pass
+
+        is_owner = interaction.user.id == user_id_from_topic
+        is_staff = any(role.permissions.manage_messages for role in interaction.user.roles)
+        
+        if not (is_owner or is_staff):
+            await interaction.response.send_message("❌ No tienes permisos para cerrar este ticket.", ephemeral=True)
+            return
+
+        # Embed de confirmación
+        embed = discord.Embed(
+            title="🔒 Cerrar Ticket",
+            description=(
+                "**¿Estás seguro de que quieres cerrar este ticket?**\n\n"
+                "✅ **Sí, Cerrar** - El ticket se archivará y se enviará transcript\n"
+                "❌ **Cancelar** - Mantener el ticket abierto"
+            ),
+            color=discord.Color.orange()
+        )
+        
+        view = ConfirmCloseView()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @discord.ui.button(label="➕ Agregar Usuario", style=discord.ButtonStyle.green, custom_id="add_user")
+    async def add_user(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Solo staff puede agregar usuarios
+        if not any(role.permissions.manage_messages for role in interaction.user.roles):
+            await interaction.response.send_message("❌ Solo el staff puede agregar usuarios.", ephemeral=True)
+            return
+
+        modal = AddUserModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="🗑️ Eliminar", style=discord.ButtonStyle.danger, custom_id="delete_ticket")
+    async def delete_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Solo administradores pueden eliminar directamente
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Solo los administradores pueden eliminar tickets directamente.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="🗑️ Eliminar Ticket",
+            description="**¿Estás seguro de que quieres ELIMINAR este ticket?**\n\n⚠️ **Esta acción no se puede deshacer y no se guardará transcript.**",
+            color=discord.Color.red()
+        )
+        
+        view = ConfirmDeleteView()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+class ConfirmCloseView(View):
+    def __init__(self):
+        super().__init__(timeout=30)
+
+    @discord.ui.button(label="✅ Sí, Cerrar", style=discord.ButtonStyle.red)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.channel
+        guild = interaction.guild
+        
+        # Obtener información del usuario del topic
+        user_id = None
+        user = None
+        channel_topic = channel.topic or ""
+        
+        if "| ID: " in channel_topic:
+            try:
+                user_id = int(channel_topic.split("| ID: ")[1].split(" |")[0])
+                user = await guild.fetch_member(user_id)
+            except:
+                pass
+
+        # Crear transcript
+        messages = []
+        async for message in channel.history(limit=200, oldest_first=True):
+            if not message.author.bot:  # Excluir mensajes de bots
+                timestamp = message.created_at.strftime("%d/%m/%Y %H:%M")
+                messages.append(f"[{timestamp}] {message.author.display_name}: {message.content}")
+        
+        transcript_text = "\n".join(messages) if messages else "No hay mensajes en este ticket."
+        
+        # Enviar transcript por DM si es posible
+        if user:
+            try:
+                transcript_embed = discord.Embed(
+                    title="📝 Transcript del Ticket Cerrado",
+                    description=(
+                        f"**Ticket:** `{channel.name}`\n"
+                        f"**Cerrado por:** {interaction.user.mention}\n"
+                        f"**Fecha:** {discord.utils.utcnow().strftime('%d/%m/%Y %H:%M')}\n\n"
+                        f"**Cantidad de mensajes:** {len(messages)}"
+                    ),
+                    color=discord.Color.blue()
+                )
+                
+                # Crear archivo de transcript
+                transcript_file = discord.File(
+                    io.BytesIO(transcript_text.encode('utf-8')), 
+                    filename=f"transcript-{channel.name}.txt"
+                )
+                
+                await user.send(embed=transcript_embed, file=transcript_file)
+                transcript_sent = True
+            except:
+                transcript_sent = False
+        else:
+            transcript_sent = False
+
+        # Log del cierre
+        if ticket_logs_channel_id:
+            log_channel = guild.get_channel(ticket_logs_channel_id)
+            if log_channel:
+                log_embed = discord.Embed(
+                    title="🔒 TICKET CERRADO",
+                    description=(
+                        f"**Ticket:** `{channel.name}`\n"
+                        f"**Usuario:** {user.mention if user else 'Desconocido'}\n"
+                        f"**Cerrado por:** {interaction.user.mention}\n"
+                        f"**Transcript enviado:** {'✅' if transcript_sent else '❌'}"
+                    ),
+                    color=discord.Color.orange(),
+                    timestamp=discord.utils.utcnow()
+                )
+                await log_channel.send(embed=log_embed)
+
+        # Cambiar permisos antes de eliminar (solo lectura)
+        try:
+            await channel.set_permissions(
+                guild.default_role,
+                view_channel=False
+            )
+            
+            # Enviar mensaje final
+            close_embed = discord.Embed(
+                title="🔒 Ticket Cerrado",
+                description=(
+                    f"Este ticket ha sido cerrado por {interaction.user.mention}\n\n"
+                    f"**Transcript:** {'✅ Enviado por DM' if transcript_sent else '❌ No se pudo enviar'}\n"
+                    f"**El canal será eliminado en 10 segundos...**"
+                ),
+                color=discord.Color.red()
+            )
+            await channel.send(embed=close_embed)
+            
+            # Esperar y eliminar
+            await asyncio.sleep(10)
+            await channel.delete()
+            
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error al cerrar el ticket: {e}", ephemeral=True)
+
+    @discord.ui.button(label="❌ Cancelar", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="✅ Operación cancelada.", embed=None, view=None)
+
+class ConfirmDeleteView(View):
+    def __init__(self):
+        super().__init__(timeout=30)
+
+    @discord.ui.button(label="🗑️ Sí, Eliminar", style=discord.ButtonStyle.danger)
+    async def confirm_delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.channel
+        guild = interaction.guild
+        
+        # Log de eliminación
+        if ticket_logs_channel_id:
+            log_channel = guild.get_channel(ticket_logs_channel_id)
+            if log_channel:
+                log_embed = discord.Embed(
+                    title="🗑️ TICKET ELIMINADO",
+                    description=(
+                        f"**Ticket:** `{channel.name}`\n"
+                        f"**Eliminado por:** {interaction.user.mention}\n"
+                        f"**Razón:** Eliminación directa (sin transcript)"
+                    ),
+                    color=discord.Color.red(),
+                    timestamp=discord.utils.utcnow()
+                )
+                await log_channel.send(embed=log_embed)
+
+        await interaction.response.edit_message(content="🗑️ Eliminando ticket...", embed=None, view=None)
+        await asyncio.sleep(2)
+        await channel.delete()
+
+    @discord.ui.button(label="❌ Cancelar", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="✅ Eliminación cancelada.", embed=None, view=None)
+
+class AddUserModal(Modal, title="Agregar Usuario al Ticket"):
+    user_input = TextInput(
+        label="ID o Mención del Usuario",
+        placeholder="Ingresa el ID o menciona al usuario...",
+        max_length=100
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            # Intentar obtener el usuario de diferentes formas
+            user = None
+            
+            # Si es una mención
+            if "<@" in self.user_input.value:
+                user_id = int(self.user_input.value.replace('<@', '').replace('>', '').replace('!', ''))
+                user = await interaction.guild.fetch_member(user_id)
+            # Si es un ID numérico
+            elif self.user_input.value.isdigit():
+                user = await interaction.guild.fetch_member(int(self.user_input.value))
+            # Si es un nombre
+            else:
+                # Buscar por nombre
+                members = interaction.guild.members
+                for member in members:
+                    if self.user_input.value.lower() in member.name.lower() or self.user_input.value.lower() in member.display_name.lower():
+                        user = member
+                        break
+            
+            if not user:
+                await interaction.response.send_message(
+                    "❌ Usuario no encontrado. Asegúrate de usar ID, mención o nombre correcto.",
+                    ephemeral=True
+                )
+                return
+            
+            # Agregar permisos al canal
+            await interaction.channel.set_permissions(
+                user,
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True
+            )
+            
+            success_embed = discord.Embed(
+                title="✅ Usuario Agregado",
+                description=f"{user.mention} ha sido agregado al ticket.",
+                color=discord.Color.green()
+            )
+            await interaction.response.send_message(embed=success_embed)
+            
+            # Anunciar en el ticket
+            announce_embed = discord.Embed(
+                title="👤 Usuario Agregado",
+                description=f"{user.mention} fue agregado al ticket por {interaction.user.mention}",
+                color=discord.Color.blue()
+            )
+            await interaction.channel.send(embed=announce_embed)
+            
+        except discord.NotFound:
+            await interaction.response.send_message(
+                "❌ Usuario no encontrado en el servidor.",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Error: {str(e)}",
+                ephemeral=True
+            )
 
 @bot.command()
+@commands.has_permissions(administrator=True)
 async def panelticket(ctx):
-    await ctx.send("🎫 Panel de tickets: (Próximamente funcional)")
+    """Crea el panel de tickets en el canal actual"""
+    embed = discord.Embed(
+        title="🎫 SISTEMA DE TICKETS DE SOPORTE",
+        description=(
+            "**¿Necesitas ayuda? ¡Estamos aquí para ayudarte!**\n\n"
+            "🔹 **¿Qué son los tickets?**\n"
+            "• Canales privados para recibir soporte personalizado\n"
+            "• Solo tú y el equipo de staff pueden ver el contenido\n"
+            "• Respuesta rápida y organizada\n\n"
+            "**👇 Haz clic en el botón de abajo para crear tu ticket**"
+        ),
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="📋 Instrucciones",
+        value="1. Haz clic en **🎫 Crear Ticket**\n2. Describe tu problema en detalle\n3. Espera la respuesta del staff",
+        inline=False
+    )
+    embed.set_footer(text="Sistema de Tickets • Soporte 24/7")
+    
+    view = TicketSetupView()
+    await ctx.send(embed=embed, view=view)
+    
+    # Mensaje de confirmación
+    confirm_embed = discord.Embed(
+        description="✅ **Panel de tickets creado exitosamente!**",
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=confirm_embed, delete_after=10)
+    
+    try:
+        await ctx.message.delete()
+    except:
+        pass
+
+@bot.command()
+@commands.has_permissions(manage_channels=True)
+async def cerrarticket(ctx):
+    """Cierra el ticket actual (solo staff)"""
+    if not ctx.channel.name.startswith("ticket-"):
+        await ctx.send("❌ Este comando solo funciona en canales de ticket.")
+        return
+    
+    channel = ctx.channel
+    guild = ctx.guild
+    
+    # Obtener información del usuario del topic
+    user_id = None
+    user = None
+    channel_topic = channel.topic or ""
+    
+    if "| ID: " in channel_topic:
+        try:
+            user_id = int(channel_topic.split("| ID: ")[1].split(" |")[0])
+            user = await guild.fetch_member(user_id)
+        except:
+            pass
+
+    # Crear transcript
+    messages = []
+    async for message in channel.history(limit=200, oldest_first=True):
+        if not message.author.bot:
+            timestamp = message.created_at.strftime("%d/%m/%Y %H:%M")
+            messages.append(f"[{timestamp}] {message.author.display_name}: {message.content}")
+    
+    transcript_text = "\n".join(messages) if messages else "No hay mensajes en este ticket."
+    
+    # Enviar transcript por DM si es posible
+    if user:
+        try:
+            transcript_embed = discord.Embed(
+                title="📝 Transcript del Ticket Cerrado",
+                description=(
+                    f"**Ticket:** `{channel.name}`\n"
+                    f"**Cerrado por:** {ctx.author.mention}\n"
+                    f"**Fecha:** {discord.utils.utcnow().strftime('%d/%m/%Y %H:%M')}"
+                ),
+                color=discord.Color.blue()
+            )
+            
+            transcript_file = discord.File(
+                io.BytesIO(transcript_text.encode('utf-8')), 
+                filename=f"transcript-{channel.name}.txt"
+            )
+            
+            await user.send(embed=transcript_embed, file=transcript_file)
+            transcript_sent = True
+        except:
+            transcript_sent = False
+    else:
+        transcript_sent = False
+
+    # Log del cierre
+    if ticket_logs_channel_id:
+        log_channel = guild.get_channel(ticket_logs_channel_id)
+        if log_channel:
+            log_embed = discord.Embed(
+                title="🔒 TICKET CERRADO",
+                description=(
+                    f"**Ticket:** `{channel.name}`\n"
+                    f"**Usuario:** {user.mention if user else 'Desconocido'}\n"
+                    f"**Cerrado por:** {ctx.author.mention}\n"
+                    f"**Transcript enviado:** {'✅' if transcript_sent else '❌'}"
+                ),
+                color=discord.Color.orange(),
+                timestamp=discord.utils.utcnow()
+            )
+            await log_channel.send(embed=log_embed)
+
+    # Mensaje final y eliminación
+    close_embed = discord.Embed(
+        title="🔒 Ticket Cerrado",
+        description=(
+            f"Este ticket ha sido cerrado por {ctx.author.mention}\n\n"
+            f"**Transcript:** {'✅ Enviado por DM' if transcript_sent else '❌ No se pudo enviar'}\n"
+            f"**El canal será eliminado en 5 segundos...**"
+        ),
+        color=discord.Color.red()
+    )
+    await ctx.send(embed=close_embed)
+    
+    await asyncio.sleep(5)
+    await channel.delete()
+
+@bot.command()
+@commands.has_permissions(manage_channels=True)
+async def agregarusuario(ctx, member: discord.Member):
+    """Agrega un usuario al ticket actual"""
+    if not ctx.channel.name.startswith("ticket-"):
+        await ctx.send("❌ Este comando solo funciona en canales de ticket.")
+        return
+    
+    await ctx.channel.set_permissions(
+        member,
+        view_channel=True,
+        send_messages=True,
+        read_message_history=True,
+        attach_files=True
+    )
+    
+    embed = discord.Embed(
+        title="✅ Usuario Agregado",
+        description=f"{member.mention} ha sido agregado al ticket por {ctx.author.mention}",
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def ticketstats(ctx):
+    """Muestra estadísticas de tickets"""
+    if not ticket_category_id:
+        await ctx.send("❌ El sistema de tickets no está configurado.")
+        return
+        
+    category = ctx.guild.get_channel(ticket_category_id)
+    if not category:
+        await ctx.send("❌ No se encontró la categoría de tickets.")
+        return
+    
+    active_tickets = len([ch for ch in category.channels if ch.name.startswith("ticket-")])
+    
+    embed = discord.Embed(
+        title="📊 Estadísticas de Tickets",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="🎫 Tickets Activos", value=f"**{active_tickets}** tickets abiertos", inline=True)
+    embed.add_field(name="📁 Categoría", value=category.mention, inline=True)
+    embed.add_field(name="👥 Capacidad", value=f"{active_tickets}/{50} canales", inline=True)
+    
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def resettickets(ctx):
+    """Reinicia completamente el sistema de tickets (elimina todo)"""
+    embed = discord.Embed(
+        title="🔄 Reiniciar Sistema de Tickets",
+        description=(
+            "**¿Estás seguro de que quieres reiniciar el sistema de tickets?**\n\n"
+            "⚠️ **Esto eliminará:**\n"
+            "• Todos los tickets activos\n"
+            "• La categoría de tickets\n"
+            "• Los canales de panel y logs\n"
+            "• Toda la configuración\n\n"
+            "**Esta acción no se puede deshacer.**"
+        ),
+        color=discord.Color.red()
+    )
+    
+    class ResetConfirmView(View):
+        def __init__(self):
+            super().__init__(timeout=30)
+        
+        @discord.ui.button(label="✅ Sí, Reiniciar", style=discord.ButtonStyle.danger)
+        async def confirm_reset(self, interaction: discord.Interaction, button: discord.ui.Button):
+            global ticket_category_id, ticket_panel_channel_id, ticket_logs_channel_id
+            
+            if interaction.user != ctx.author:
+                await interaction.response.send_message("❌ Solo quien ejecutó el comando puede confirmar.", ephemeral=True)
+                return
+                
+            await interaction.response.edit_message(content="🔄 Reiniciando sistema de tickets...", embed=None, view=None)
+            
+            # Eliminar categoría y todos los canales
+            try:
+                if ticket_category_id:
+                    category = ctx.guild.get_channel(ticket_category_id)
+                    if category:
+                        for channel in category.channels:
+                            await channel.delete()
+                        await category.delete()
+                        
+                # Resetear variables globales
+                ticket_category_id = None
+                ticket_panel_channel_id = None
+                ticket_logs_channel_id = None
+                
+                success_embed = discord.Embed(
+                    title="✅ Sistema de Tickets Reiniciado",
+                    description="El sistema de tickets ha sido completamente reiniciado.\nUsa `!panelticket` para crear un nuevo panel.",
+                    color=discord.Color.green()
+                )
+                await interaction.followup.send(embed=success_embed)
+                
+            except Exception as e:
+                error_embed = discord.Embed(
+                    title="❌ Error al Reiniciar",
+                    description=f"No se pudo reiniciar el sistema: {str(e)}",
+                    color=discord.Color.red()
+                )
+                await interaction.followup.send(embed=error_embed)
+        
+        @discord.ui.button(label="❌ Cancelar", style=discord.ButtonStyle.grey)
+        async def cancel_reset(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if interaction.user != ctx.author:
+                await interaction.response.send_message("❌ Solo quien ejecutó el comando puede cancelar.", ephemeral=True)
+                return
+            await interaction.response.edit_message(content="✅ Reinicio cancelado.", embed=None, view=None)
+    
+    await ctx.send(embed=embed, view=ResetConfirmView())
 
 # ------------------ MINIJUEGOS ------------------
 
@@ -1981,13 +3549,89 @@ async def ppt_error(ctx, error):
 
 # ------------------ MÁQUINA TRAGAPERRAS ------------------
 
+class SlotsRematchView(discord.ui.View):
+    def __init__(self, ctx, cantidad, last_winnings, total_ganado=0):
+        super().__init__(timeout=30)
+        self.ctx = ctx
+        self.cantidad = cantidad
+        self.last_winnings = last_winnings
+        self.total_ganado = total_ganado + last_winnings  # acumula el total
+        self.result_msg = None
+
+    async def disable_all(self, interaction=None):
+        for b in self.children:
+            b.disabled = True
+        if interaction:
+            try:
+                await interaction.response.edit_message(view=self)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="Sí, jugar otra vez", style=discord.ButtonStyle.green)
+    async def si(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message("Solo quien jugó puede usar esto.", ephemeral=True)
+            return
+
+        for b in self.children:
+            b.disabled = True
+        await interaction.response.edit_message(content="🔄 Reiniciando partida...", view=self)
+        try:
+            # se pasa el total_ganado acumulado a la siguiente partida
+            await self.ctx.invoke(bot.get_command("slots"), str(self.cantidad), self.total_ganado)
+        except Exception as e:
+            await self.ctx.send(f"Error al reiniciar la partida: {e}")
+
+    @discord.ui.button(label="Cambiar apuesta", style=discord.ButtonStyle.grey)
+    async def cambiar_apuesta(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message("Solo quien jugó puede usar esto.", ephemeral=True)
+            return
+
+        await interaction.response.send_message("💰 ¿Qué nueva apuesta deseas poner? (escribe un número o 'all')", ephemeral=True)
+
+        def check(m):
+            return m.author == self.ctx.author and m.channel == self.ctx.channel
+
+        try:
+            msg = await bot.wait_for("message", check=check, timeout=30)
+            nueva_apuesta = msg.content.strip()
+
+            await msg.delete()
+            await interaction.followup.send(f"🔄 Reiniciando partida con apuesta **{nueva_apuesta}**...", ephemeral=False)
+            await self.ctx.invoke(bot.get_command("slots"), nueva_apuesta, self.total_ganado)
+        except asyncio.TimeoutError:
+            await interaction.followup.send("⌛ Tiempo agotado. No se cambió la apuesta.", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"⚠️ Error al cambiar apuesta: {e}", ephemeral=True)
+
+        for b in self.children:
+            b.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except:
+            pass
+
+    @discord.ui.button(label="Parar", style=discord.ButtonStyle.red)
+    async def parar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message("Solo quien jugó puede usar esto.", ephemeral=True)
+            return
+
+        self.terminado = True
+        for b in self.children:
+            b.disabled = True
+
+        await interaction.response.edit_message(
+            content=f"👋 ¡Gracias por jugar!\n💎 Total ganado en esta sesión: **{self.total_ganado}** <:amatista:1420736192269390006>",
+            view=self
+        )
+
+
 @bot.command(aliases=["maquina"])
-@commands.cooldown(1, 15, commands.BucketType.user)  # cooldown de 15 segundos
-async def slots(ctx, cantidad: str):
-    """
-    !maquina <cantidad|all>
-    Juega a la máquina tragaperras con tu cash.
-    """
+@commands.cooldown(1, 15, commands.BucketType.user)
+async def slots(ctx, cantidad: str, total_ganado: int = 0):
+    """!maquina <cantidad|all>"""
     datos = cargar_datos()
     uid = str(ctx.author.id)
     asegurar_usuario(datos, uid)
@@ -2005,14 +3649,12 @@ async def slots(ctx, cantidad: str):
         await ctx.send("❌ No tienes suficiente cash para esa apuesta.")
         return
 
-    # Deduct bet
+    # restar apuesta
     restar_de_cash(datos, uid, apuesta)
     guardar_datos(datos)
 
-    # Símbolos para la máquina
     simbolos = ["🍒", "🍋", "🍊", "🍇", "🔔", "⭐", "💎"]
 
-    # Initial embed
     embed = discord.Embed(
         title="🎰 Slots",
         description=f"Bet: **{apuesta}** <:amatista:1420736192269390006>\n\nSpinning...\n\n🍒 | 🍋 | 🍊",
@@ -2020,83 +3662,64 @@ async def slots(ctx, cantidad: str):
     )
     message = await ctx.send(embed=embed)
 
-    # Animation loop: 10 spins with increasing delay
     for i in range(10):
         reel1 = random.choice(simbolos)
         reel2 = random.choice(simbolos)
         reel3 = random.choice(simbolos)
         embed.description = f"Bet: **{apuesta}** <:amatista:1420736192269390006>\n\nSpinning...\n\n{reel1} | {reel2} | {reel3}"
         await message.edit(embed=embed)
-        delay = 0.3 + i * 0.1  # Start at 0.3s, increase by 0.1s each time
-        await asyncio.sleep(delay)
+        await asyncio.sleep(0.3 + i * 0.1)
 
-    # Final reels with weights
-    pesos = [30, 25, 20, 15, 6, 3, 1]  # probabilidades relativas
+    pesos = [30, 25, 20, 15, 6, 3, 1]
     reel1 = random.choices(simbolos, weights=pesos, k=1)[0]
     reel2 = random.choices(simbolos, weights=pesos, k=1)[0]
     reel3 = random.choices(simbolos, weights=pesos, k=1)[0]
-
+        # Mostrar resultado final
     resultado = f"{reel1} | {reel2} | {reel3}"
 
-    # Calcular ganancia
     ganancia = 0
     if reel1 == reel2 == reel3:
-        if reel1 == "🍒":
-            ganancia = apuesta * 10
-        elif reel1 == "🍋":
-            ganancia = apuesta * 8
-        elif reel1 == "🍊":
-            ganancia = apuesta * 6
-        elif reel1 == "🍇":
-            ganancia = apuesta * 5
-        elif reel1 == "🔔":
-            ganancia = apuesta * 4
-        elif reel1 == "⭐":
-            ganancia = apuesta * 3
-        elif reel1 == "💎":
-            ganancia = apuesta * 2
+        mults = {"🍒": 10, "🍋": 8, "🍊": 6, "🍇": 5, "🔔": 4, "⭐": 3, "💎": 2}
+        ganancia = apuesta * mults.get(reel1, 2)
     elif reel1 == reel2 or reel2 == reel3 or reel1 == reel3:
-        # Dos iguales
         ganancia = apuesta * 2
 
+    # Mostrar solo los símbolos por 1 segundo antes del resultado
+    embed.description = f"Bet: **{apuesta}** <:amatista:1420736192269390006>\n\n🎰 Resultado:\n{resultado}"
+    await message.edit(embed=embed)
+    await asyncio.sleep(1)  # <- Espera 1 segundo antes de mostrar el resultado
+
+    # Mostrar el resultado (ganado o perdido)
     if ganancia > 0:
         mult = obtener_multiplicador(datos, uid, "slots")
         ganancia = int(ganancia * mult)
         agregar_a_cash_y_monedas(datos, uid, ganancia)
-        embed.description = f"Bet: **{apuesta}** <:amatista:1420736192269390006>\n\n**GANASTE!** {resultado}\nGanaste **{ganancia}** <:amatista:1420736192269390006>."
+        embed.description += f"\n\n**GANASTE!** 💎\nGanaste **{ganancia}** <:amatista:1420736192269390006>."
     else:
-        embed.description = f"Bet: **{apuesta}** <:amatista:1420736192269390006>\n\n**PERDISTE.** {resultado}\nPerdiste **{apuesta}** <:amatista:1420736192269390006>."
+        embed.description += f"\n\n**PERDISTE.** 😢\nPerdiste **{apuesta}** <:amatista:1420736192269390006>."
 
-    await message.edit(embed=embed)
+    await message.edit(embed=embed, view=SlotsRematchView(ctx, cantidad, ganancia, total_ganado))
     guardar_datos(datos)
 
-@slots.error
-async def slots_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
-        await ctx.send(f"🕒 Debes esperar {formato_tiempo(error.retry_after)} antes de volver a jugar a la máquina.")
-    else:
-        raise error
 
-# ------------------ RULETA ------------------
 
 @bot.command()
-@commands.cooldown(1, 20, commands.BucketType.user)  # cooldown de 20 segundos
+@commands.cooldown(1, 20, commands.BucketType.user)
 async def ruleta(ctx, cantidad: str, tipo: str, numero: str = None):
-    """
-    !ruleta <cantidad|all> <tipo> [numero]
-    Tipos: rojo, negro, par, impar, numero (si numero, especifica el número 0-36)
-    """
+    import random, asyncio, discord
+
     datos = cargar_datos()
     uid = str(ctx.author.id)
     asegurar_usuario(datos, uid)
 
+    # Procesar apuesta
     if cantidad.lower() == "all":
         apuesta = datos[uid].get("cash", 0)
     else:
         try:
             apuesta = int(cantidad)
         except:
-            await ctx.send("❌ Cantidad inválida. Usa un número o 'all'.")
+            await ctx.send("❌ Cantidad inválida.")
             return
 
     if apuesta <= 0 or datos[uid].get("cash", 0) < apuesta:
@@ -2110,23 +3733,85 @@ async def ruleta(ctx, cantidad: str, tipo: str, numero: str = None):
 
     if tipo == "numero":
         if numero is None:
-            await ctx.send("❌ Para 'numero', especifica un número entre 0 y 36.")
+            await ctx.send("❌ Debes poner el número (0–36).")
             return
         try:
             num_apostado = int(numero)
             if not 0 <= num_apostado <= 36:
-                await ctx.send("❌ Número debe estar entre 0 y 36.")
+                await ctx.send("❌ Número fuera de rango.")
                 return
         except:
             await ctx.send("❌ Número inválido.")
             return
 
-    # Girar la ruleta
+    # Configuración de colores
+    rojos = [1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]
+    negros = [2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35]
+    numeros = list(range(37))
     numero_ganador = random.randint(0, 36)
-    color_ganador = "rojo" if numero_ganador in [1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36] else "negro" if numero_ganador != 0 else "verde"
-    paridad = "par" if numero_ganador % 2 == 0 and numero_ganador != 0 else "impar"
+    color_ganador = (
+        "rojo" if numero_ganador in rojos else
+        "negro" if numero_ganador != 0 else
+        "verde"
+    )
 
-    # Verificar apuesta
+    # Círculo de 12 posiciones (representación circular simple)
+    posiciones = [
+        (0, "🔴1"), (1, "⚫2"), (2, "🔴3"),
+        (3, "⚫4"), (4, "🔴5"), (5, "⚫6"),
+        (6, "🔴7"), (7, "⚫8"), (8, "🔴9"),
+        (9, "⚫10"), (10, "🔴11"), (11, "🟩0")
+    ]
+    total_pos = len(posiciones)
+    index_ganador = random.randint(0, total_pos - 1)
+    index_actual = random.randint(0, total_pos - 1)
+
+    # Embed inicial
+    embed = discord.Embed(
+        title="🎡 Ruleta girando...",
+        description="",
+        color=discord.Color.gold()
+    )
+    message = await ctx.send(embed=embed)
+
+    def generar_ruleta(pos):
+        """Devuelve un diseño circular en texto con la bola ⚪ en 'pos'."""
+        circle = ["   "]*12
+        for i, (_, emoji) in enumerate(posiciones):
+            circle[i] = emoji
+        circle[pos % total_pos] = "⚪"
+
+        # Círculo de 3 filas
+        return (
+            f"   {circle[0]} {circle[1]} {circle[2]}\n"
+            f" {circle[11]}       {circle[3]}\n"
+            f"{circle[10]}         {circle[4]}\n"
+            f" {circle[9]}       {circle[5]}\n"
+            f"   {circle[8]} {circle[7]} {circle[6]}"
+        )
+
+    # Animación del giro (ralentizando)
+    pasos = random.randint(35, 50)
+    for i in range(pasos):
+        embed.description = (
+            f"Apuesta: **{apuesta}** <:amatista:1420736192269390006>\n\n"
+            + generar_ruleta(index_actual)
+        )
+        await message.edit(embed=embed)
+        index_actual = (index_actual + 1) % total_pos
+        await asyncio.sleep(0.05 + (i / pasos) * 0.07)
+
+    # Mostrar resultado
+    resultado = posiciones[index_ganador][1]
+    embed.title = "🎯 Ruleta detenida"
+    embed.description = (
+        f"Apuesta: **{apuesta}** <:amatista:1420736192269390006>\n\n"
+        f"{generar_ruleta(index_ganador)}\n\n"
+        f"➡️ **Número ganador:** {resultado}"
+    )
+
+    # Determinar si gana
+    paridad = "par" if numero_ganador % 2 == 0 and numero_ganador != 0 else "impar"
     gano = False
     if tipo == "rojo" and color_ganador == "rojo":
         gano = True
@@ -2139,41 +3824,35 @@ async def ruleta(ctx, cantidad: str, tipo: str, numero: str = None):
     elif tipo == "numero" and numero_ganador == num_apostado:
         gano = True
 
+    # Resultado final
     if gano:
-        if tipo == "numero":
-            ganancia_base = apuesta * 35  # payout para número exacto
-        else:
-            ganancia_base = apuesta * 1.8  # payout para otros tipos
-        mult = obtener_multiplicador(datos, uid, "roulette")
-        ganancia = int(ganancia_base * mult)
+        ganancia = int(apuesta * (35 if tipo == "numero" else 1.8))
         agregar_a_cash_y_monedas(datos, uid, ganancia)
-        await ctx.send(f"🎡 **GANASTE!** Salió {numero_ganador} ({color_ganador}). Ganaste **{ganancia}** <:amatista:1420736192269390006>.")
+        embed.description += f"\n\n✅ **¡GANASTE!** +{ganancia} <:amatista:1420736192269390006>"
+        embed.color = discord.Color.green()
     else:
         restar_de_cash(datos, uid, apuesta)
-        await ctx.send(f"🎡 **PERDISTE.** Salió {numero_ganador} ({color_ganador}). Perdiste **{apuesta}** <:amatista:1420736192269390006>.")
+        embed.description += f"\n\n❌ **Perdiste.** -{apuesta} <:amatista:1420736192269390006>"
+        embed.color = discord.Color.red()
 
+    await message.edit(embed=embed)
     guardar_datos(datos)
 
-@ruleta.error
-async def ruleta_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
-        await ctx.send(f"🕒 Debes esperar {formato_tiempo(error.retry_after)} antes de volver a jugar a la ruleta.")
-    else:
-        raise error
-
-# ------------------ DADOS ------------------
 
 @bot.command()
-@commands.cooldown(1, 10, commands.BucketType.user)  # cooldown de 10 segundos
+@commands.cooldown(1, 10, commands.BucketType.user)
 async def dado(ctx, cantidad: str, tipo: str):
     """
     !dado <cantidad|all> <tipo>
-    Tipos: alto (suma > 7), bajo (suma < 7), suma (espera suma exacta, pero por simplicidad, alto/bajo)
+    Tipos: alto (suma > 7), bajo (suma < 7)
     """
+    
+
     datos = cargar_datos()
     uid = str(ctx.author.id)
     asegurar_usuario(datos, uid)
 
+    # --- Validación de apuesta ---
     if cantidad.lower() == "all":
         apuesta = datos[uid].get("cash", 0)
     else:
@@ -2189,38 +3868,68 @@ async def dado(ctx, cantidad: str, tipo: str):
 
     tipo = tipo.lower()
     if tipo not in ["alto", "bajo"]:
-        await ctx.send("❌ Tipo inválido. Usa: alto, bajo.")
+        await ctx.send("❌ Tipo inválido. Usa: `alto` o `bajo`.")
         return
 
-    # Tirar dos dados
+    # --- Animación de lanzamiento ---
+    embed = discord.Embed(
+        title="🎲 Lanzando los dados...",
+        description="Tirando 🎲🎲...",
+        color=discord.Color.gold()
+    )
+    message = await ctx.send(embed=embed)
+    
+    dados_emojis = {
+        1: "🎲💠1️⃣",
+        2: "🎲💠2️⃣",
+        3: "🎲💠3️⃣",
+        4: "🎲💠4️⃣",
+        5: "🎲💠5️⃣",
+        6: "🎲💠6️⃣"
+    }
+
+    # Animación corta de “tirada”
+    for _ in range(8):
+        dado1 = random.randint(1, 6)
+        dado2 = random.randint(1, 6)
+        embed.description = f"🎲 {dados_emojis[dado1]}  {dados_emojis[dado2]}\n\nGirando..."
+        await message.edit(embed=embed)
+        await asyncio.sleep(0.25)
+
+    # --- Resultado final ---
     dado1 = random.randint(1, 6)
     dado2 = random.randint(1, 6)
     suma = dado1 + dado2
 
-    gano = False
-    if tipo == "alto" and suma > 7:
-        gano = True
-    elif tipo == "bajo" and suma < 7:
-        gano = True
+    # Determinar si gana o pierde
+    gano = (tipo == "alto" and suma > 7) or (tipo == "bajo" and suma < 7)
+
+    # Mostrar resultado final
+    embed.title = "🎲 Resultado final"
+    embed.description = f"{dados_emojis[dado1]}  {dados_emojis[dado2]}  ➜ **Suma:** {suma}"
 
     if gano:
         ganancia_base = apuesta * 1.5
         mult = obtener_multiplicador(datos, uid, "dice")
         ganancia = int(ganancia_base * mult)
         agregar_a_cash_y_monedas(datos, uid, ganancia)
-        await ctx.send(f"🎲 **GANASTE!** Dados: {dado1} + {dado2} = {suma}. Ganaste **{ganancia}** <:amatista:1420736192269390006>.")
+        embed.add_field(
+            name="✅ ¡Has ganado!",
+            value=f"Ganaste **{ganancia}** <:amatista:1420736192269390006>.",
+            inline=False
+        )
+        embed.color = discord.Color.green()
     else:
         restar_de_cash(datos, uid, apuesta)
-        await ctx.send(f"🎲 **PERDISTE.** Dados: {dado1} + {dado2} = {suma}. Perdiste **{apuesta}** <:amatista:1420736192269390006>.")
+        embed.add_field(
+            name="❌ Perdiste",
+            value=f"Perdiste **{apuesta}** <:amatista:1420736192269390006>.",
+            inline=False
+        )
+        embed.color = discord.Color.red()
 
+    await message.edit(embed=embed)
     guardar_datos(datos)
-
-@dado.error
-async def dado_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
-        await ctx.send(f"🕒 Debes esperar {formato_tiempo(error.retry_after)} antes de volver a jugar con dados.")
-    else:
-        raise error
 
 # ------------------ INFO / TRABAJO / ECONOMÍA ------------------
 
@@ -2679,8 +4388,21 @@ COMMAND_CATEGORIES = {
         "!ruleta (cantidad|all) (tipo)": "Juega a la ruleta con tu cash (tipos: rojo/negro/par/impar/numero).",
         "!dado (cantidad|all) (tipo)": "Juega con dados con tu cash (tipos: alto/bajo/suma)."
     },
+    "tickets": {
+        "!panelticket": "Crea el panel de tickets de soporte. (Admin)",
+        "!cerrarticket": "Cierra el ticket actual. (Staff)",
+        "!agregarusuario @usuario": "Agrega un usuario al ticket actual. (Staff)",
+        "!ticketstats": "Muestra estadísticas de tickets. (Admin)",
+        "!resettickets": "Reinicia completamente el sistema de tickets. (Admin)"
+    },
+    "streams": {
+        "!addstream [plataforma] [usuario/URL]": "Registra tu stream para notificaciones automáticas. (Miembros)",
+        "!mystreams": "Muestra tus streams registrados.",
+        "!delstream [número]": "Elimina uno de tus streams registrados.",
+        "!streams": "Muestra todos los streams registrados en el servidor.",
+        "!teststream [plataforma] [usuario]": "Prueba una notificación de stream. (Admin)"
+    },
     "otros": {
-        "!panelticket": "Muestra el panel para crear tickets.",
         "!ayuda (categoria)": "Muestra la lista de comandos o los de una categoría específica."
     },
     "funciones": {
@@ -2689,6 +4411,8 @@ COMMAND_CATEGORIES = {
         "Moderación Completa": "Comandos para admins: kick, ban, clear, avisos, reactroles, gestión de dinero.",
         "Sistema de Niveles y XP": "Gana XP por mensajes, sube niveles con recompensas cada 10 niveles.",
         "Registro de Miembros": "Panel interactivo para registrarse como freestyler o competitivo con roles automáticos.",
+        "Sistema de Tickets": "Tickets de soporte privados con transcripts y gestión automática.",
+        "Notificaciones de Streams": "Detección automática de streams en YouTube, Twitch y TikTok.",
         "Eventos Automáticos": "Bienvenidas, asignación de roles obligatorios, logs en Discord, presencia rotativa."
     }
 }
@@ -2700,7 +4424,11 @@ def create_main_embed(ctx):
         description="Usa los botones abajo para ver los comandos de cada categoría.\n\nTambién puedes usar `!ayuda <categoría>` para ir directo.",
         color=discord.Color.purple()
     )
-    embed.add_field(name="Categorías", value="• Básicos\n• Moderación\n• Economía\n• Minijuegos\n• Otros\n• Funciones", inline=False)
+    embed.add_field(
+        name="Categorías", 
+        value="• Básicos\n• Moderación\n• Economía\n• Minijuegos\n• Tickets\n• Streams\n• Otros\n• Funciones", 
+        inline=False
+    )
     embed.set_footer(text=f"Solicitado por {ctx.author.display_name}", icon_url=ctx.author.display_avatar.url)
     return embed
 
@@ -2771,7 +4499,25 @@ class MainHelpView(View):
         view = CategoryHelpView(self.ctx)
         await interaction.response.edit_message(embed=embed, view=view)
 
-    @discord.ui.button(label="🔧 Otros", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="🎫 Tickets", style=discord.ButtonStyle.primary, row=2)
+    async def tickets(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.ctx.author:
+            await interaction.response.send_message("Solo el autor puede usar esto.", ephemeral=True)
+            return
+        embed = create_category_embed("tickets", self.ctx)
+        view = CategoryHelpView(self.ctx)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="📺 Streams", style=discord.ButtonStyle.primary, row=2)
+    async def streams(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.ctx.author:
+            await interaction.response.send_message("Solo el autor puede usar esto.", ephemeral=True)
+            return
+        embed = create_category_embed("streams", self.ctx)
+        view = CategoryHelpView(self.ctx)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="🔧 Otros", style=discord.ButtonStyle.primary, row=3)
     async def otros(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user != self.ctx.author:
             await interaction.response.send_message("Solo el autor puede usar esto.", ephemeral=True)
@@ -2780,7 +4526,7 @@ class MainHelpView(View):
         view = CategoryHelpView(self.ctx)
         await interaction.response.edit_message(embed=embed, view=view)
 
-    @discord.ui.button(label="⚙️ Funciones", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="⚙️ Funciones", style=discord.ButtonStyle.primary, row=3)
     async def funciones(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user != self.ctx.author:
             await interaction.response.send_message("Solo el autor puede usar esto.", ephemeral=True)
@@ -2800,12 +4546,14 @@ async def ayuda(ctx, categoria: str = None):
             view = CategoryHelpView(ctx)
             await ctx.send(embed=embed, view=view)
         else:
-            await ctx.send("❌ Categoría no encontrada. Usa: `basicos`, `moderacion`, `economia`, `minijuegos`, `otros`.")
+            await ctx.send(
+                "❌ Categoría no encontrada. Usa: "
+                "`basicos`, `moderacion`, `economia`, `minijuegos`, `tickets`, `streams`, `otros`."
+            )
     else:
         embed = create_main_embed(ctx)
         view = MainHelpView(ctx)
         await ctx.send(embed=embed, view=view)
-
 
 # ------------------ LEADERBOARD (!lb) ------------------
 
@@ -2830,4 +4578,4 @@ async def lb(ctx):
 
 if __name__ == "__main__":
     # Pon tu token aquí de forma segura
-    bot.run(os.getenv("DISCORD_TOKEN"))
+    bot.run(os.getenv("TOKEN"))
